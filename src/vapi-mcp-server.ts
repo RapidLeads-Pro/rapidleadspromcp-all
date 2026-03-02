@@ -6,6 +6,16 @@
 import express from 'express';
 import cors from 'cors';
 import * as dotenv from 'dotenv';
+import { randomUUID } from 'crypto';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError
+} from '@modelcontextprotocol/sdk/types.js';
 
 import { GHLApiClient } from './clients/ghl-api-client';
 import { ContactTools } from './tools/contact-tools';
@@ -56,6 +66,8 @@ class VapiMCPServer {
   private productsTools: ProductsTools;
   private invoicesTools: InvoicesTools;
   private port: number;
+  // Streamable-HTTP sessions for /mcp endpoint
+  private streamableSessions = new Map<string, StreamableHTTPServerTransport>();
 
   constructor() {
     // Railway provides PORT env var - use it!
@@ -457,7 +469,196 @@ class VapiMCPServer {
         timestamp: new Date().toISOString()
       });
     });
+
+    // -------------------------------------------------------------------
+    // SSE Transport — GET /sse opens the stream, POST /sse delivers messages
+    // Used by Kilo Code, ElevenLabs, ChatGPT (legacy SSE clients)
+    // Each connection gets its own MCP Server instance — required by SDK
+    // -------------------------------------------------------------------
+    const sseTransports = new Map<string, SSEServerTransport>();
+    const sseByIndex = new Map<number, SSEServerTransport>();
+    let sseIndex = 0;
+
+    this.app.get('/sse', async (req, res) => {
+      const idx = sseIndex++;
+      const sessionId = (req.query.sessionId as string) || `sse-${idx}`;
+      console.log(`[SSE MCP] New connection #${idx} session=${sessionId}`);
+
+      try {
+        const mcpServer = this.createMCPServer();
+        const transport = new SSEServerTransport('/sse', res);
+
+        sseTransports.set(sessionId, transport);
+        sseByIndex.set(idx, transport);
+        if (req.ip) sseTransports.set(`ip:${req.ip}`, transport);
+
+        await mcpServer.connect(transport);
+        console.log(`[SSE MCP] Ready — session=${sessionId} tools=${this.getToolsCount().total}`);
+
+        req.on('close', () => {
+          sseTransports.delete(sessionId);
+          sseByIndex.delete(idx);
+          if (req.ip) sseTransports.delete(`ip:${req.ip}`);
+          console.log(`[SSE MCP] Closed — session=${sessionId}`);
+        });
+      } catch (err) {
+        console.error(`[SSE MCP] Setup error:`, err);
+        if (!res.headersSent) res.status(500).json({ error: 'SSE setup failed' });
+        else res.end();
+      }
+    });
+
+    this.app.post('/sse', express.json(), async (req, res) => {
+      const sessionId = (req.query.sessionId as string) || 'unknown';
+
+      const transport = sseTransports.get(sessionId)
+        ?? (req.ip ? sseTransports.get(`ip:${req.ip}`) : undefined)
+        ?? (sseByIndex.size > 0
+            ? sseByIndex.get(Math.max(...Array.from(sseByIndex.keys())))
+            : undefined);
+
+      if (!transport) {
+        res.status(404).json({ error: 'SSE session not found' });
+        return;
+      }
+
+      try {
+        await transport.handlePostMessage(req, res);
+      } catch (err) {
+        console.error(`[SSE MCP] handlePostMessage error:`, err);
+        if (!res.headersSent) res.status(500).json({ error: 'Message handling failed' });
+      }
+    });
+
+    // ElevenLabs alias
+    this.app.get('/elevenlabs', async (req, res) => {
+      const idx = sseIndex++;
+      const sessionId = (req.query.sessionId as string) || `el-${idx}`;
+      console.log(`[ElevenLabs MCP] New connection #${idx}`);
+
+      try {
+        const mcpServer = this.createMCPServer();
+        const transport = new SSEServerTransport('/elevenlabs', res);
+
+        sseTransports.set(sessionId, transport);
+        sseByIndex.set(idx, transport);
+        if (req.ip) sseTransports.set(`ip:${req.ip}`, transport);
+
+        await mcpServer.connect(transport);
+
+        req.on('close', () => {
+          sseTransports.delete(sessionId);
+          sseByIndex.delete(idx);
+          if (req.ip) sseTransports.delete(`ip:${req.ip}`);
+        });
+      } catch (err) {
+        if (!res.headersSent) res.status(500).json({ error: 'SSE setup failed' });
+        else res.end();
+      }
+    });
+
+    this.app.post('/elevenlabs', express.json(), async (req, res) => {
+      const sessionId = (req.query.sessionId as string) || 'unknown';
+
+      const transport = sseTransports.get(sessionId)
+        ?? (req.ip ? sseTransports.get(`ip:${req.ip}`) : undefined)
+        ?? (sseByIndex.size > 0
+            ? sseByIndex.get(Math.max(...Array.from(sseByIndex.keys())))
+            : undefined);
+
+      if (!transport) {
+        res.status(404).json({ error: 'SSE session not found' });
+        return;
+      }
+
+      try {
+        await transport.handlePostMessage(req, res);
+      } catch (err) {
+        if (!res.headersSent) res.status(500).json({ error: 'Message handling failed' });
+      }
+    });
+
+    // -------------------------------------------------------------------
+    // Streamable-HTTP Transport — POST/GET/DELETE /mcp
+    // Used by Claude Desktop and modern MCP clients (spec 2025-03-26)
+    // -------------------------------------------------------------------
+    this.app.post('/mcp', express.json(), async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      let transport: StreamableHTTPServerTransport;
+
+      if (sessionId && this.streamableSessions.has(sessionId)) {
+        transport = this.streamableSessions.get(sessionId)!;
+      } else if (!sessionId) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            console.log(`[Streamable-HTTP MCP] Session initialized: ${sid}`);
+            this.streamableSessions.set(sid, transport);
+          },
+          onsessionclosed: (sid) => {
+            console.log(`[Streamable-HTTP MCP] Session closed: ${sid}`);
+            this.streamableSessions.delete(sid);
+          }
+        });
+        const mcpServer = this.createMCPServer();
+        await mcpServer.connect(transport);
+        console.log(`[Streamable-HTTP MCP] New session, tools=${this.getToolsCount().total}`);
+      } else {
+        res.status(400).json({ error: 'Invalid or expired session ID' });
+        return;
+      }
+
+      await transport.handleRequest(req, res);
+    });
+
+    this.app.get('/mcp', async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !this.streamableSessions.has(sessionId)) {
+        res.status(400).json({ error: 'Valid Mcp-Session-Id header required' });
+        return;
+      }
+      await this.streamableSessions.get(sessionId)!.handleRequest(req, res);
+    });
+
+    this.app.delete('/mcp', async (req, res) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (sessionId && this.streamableSessions.has(sessionId)) {
+        await this.streamableSessions.get(sessionId)!.handleRequest(req, res);
+      } else {
+        res.status(404).json({ error: 'Session not found' });
+      }
+    });
   }
+
+  /**
+   * Create a fresh MCP Server instance with all tool handlers.
+   * Must be called per-connection — the SDK does not support sharing one
+   * Server across multiple transports.
+   */
+  private createMCPServer(): Server {
+    const server = new Server(
+      { name: 'ghl-mcp-server', version: '1.0.0' },
+      { capabilities: { tools: {} } }
+    );
+
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: this.getAllToolDefinitions()
+    }));
+
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      try {
+        const result = await this.executeToolCall(name, args || {});
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        throw new McpError(ErrorCode.InternalError, `Tool execution failed: ${error}`);
+      }
+    });
+
+    return server;
+  }
+
+  // (original setupRoutes closing brace removed above — this block replaces it)
 
   /**
    * Execute a tool call
@@ -796,9 +997,12 @@ class VapiMCPServer {
       this.app.listen(this.port, '0.0.0.0', () => {
         console.log('✅ Vapi GoHighLevel MCP Server started successfully!');
         console.log(`🌐 Server running on: http://0.0.0.0:${this.port}`);
-        console.log(`🔗 MCP URL for Vapi: http://0.0.0.0:${this.port}`);
+        console.log(`🔗 Vapi endpoint:            http://0.0.0.0:${this.port}/  (POST)`);
+        console.log(`🔗 SSE endpoint (Kilo Code): http://0.0.0.0:${this.port}/sse`);
+        console.log(`🔗 Streamable-HTTP endpoint: http://0.0.0.0:${this.port}/mcp`);
+        console.log(`🔗 ElevenLabs endpoint:      http://0.0.0.0:${this.port}/elevenlabs`);
         console.log(`📋 Total Tools: ${this.getToolsCount().total}`);
-        console.log(`🎯 Protocol: Streamable HTTP (Vapi compatible)`);
+        console.log(`🎯 Protocols: Vapi (POST /), SSE (/sse), Streamable-HTTP (/mcp)`);
         console.log('==========================================');
       });
       
