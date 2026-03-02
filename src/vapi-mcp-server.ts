@@ -117,8 +117,15 @@ class VapiMCPServer {
       credentials: false
     }));
 
-    // JSON parsing middleware
-    this.app.use(express.json({ limit: '10mb' }));
+    // JSON parsing middleware — applied globally EXCEPT for SSE POST routes
+    // (SSEServerTransport.handlePostMessage reads the raw body stream itself;
+    //  if express.json() runs first the stream is already consumed → HTTP 400)
+    this.app.use((req, res, next) => {
+      const isSSEPost = (req.method === 'POST') &&
+        (req.path === '/sse' || req.path === '/elevenlabs');
+      if (isSSEPost) return next();
+      express.json({ limit: '10mb' })(req, res, next);
+    });
 
     // Request logging with Vapi headers
     this.app.use((req, res, next) => {
@@ -508,7 +515,7 @@ class VapiMCPServer {
       }
     });
 
-    this.app.post('/sse', express.json(), async (req, res) => {
+    this.app.post('/sse', async (req, res) => {
       const sessionId = (req.query.sessionId as string) || 'unknown';
 
       const transport = sseTransports.get(sessionId)
@@ -557,7 +564,7 @@ class VapiMCPServer {
       }
     });
 
-    this.app.post('/elevenlabs', express.json(), async (req, res) => {
+    this.app.post('/elevenlabs', async (req, res) => {
       const sessionId = (req.query.sessionId as string) || 'unknown';
 
       const transport = sseTransports.get(sessionId)
