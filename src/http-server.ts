@@ -544,7 +544,7 @@ class GHLMCPHttpServer {
     // POST /sse — the SDK's SSEServerTransport handles the MCP JSON-RPC body
     // automatically once connected; we just need to route the request to the
     // right transport instance.
-    this.app.post('/sse', express.json(), async (req, res) => {
+    this.app.post('/sse', async (req, res) => {
       const sessionId = (req.query.sessionId as string) || 'unknown';
       const isElevenLabs = req.headers['user-agent']?.includes('python-httpx');
       const client = isElevenLabs ? 'ElevenLabs' : 'Kilo/Claude/ChatGPT';
@@ -602,7 +602,7 @@ class GHLMCPHttpServer {
       }
     });
 
-    this.app.post('/elevenlabs', express.json(), async (req, res) => {
+    this.app.post('/elevenlabs', async (req, res) => {
       const sessionId = (req.query.sessionId as string) || 'unknown';
 
       let transport = activeTransports.get(sessionId)
