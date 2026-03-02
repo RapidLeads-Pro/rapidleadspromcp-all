@@ -579,25 +579,32 @@ class VapiMCPServer {
 
     this.app.get('/sse', async (req, res) => {
       const idx = sseIndex++;
-      const sessionId = (req.query.sessionId as string) || `sse-${idx}`;
-      console.log(`[SSE MCP] New connection #${idx} session=${sessionId}`);
+      console.log(`[SSE MCP] New connection #${idx} from ${req.ip}`);
 
       try {
         const mcpServer = this.createMCPServer();
+        // The SDK generates its own UUID sessionId and sends it to the client
+        // via the 'endpoint' SSE event as ?sessionId=<uuid>.
+        // We MUST store the transport keyed by transport.sessionId (the SDK UUID)
+        // so that POST /sse?sessionId=<uuid> lookups always match.
         const transport = new SSEServerTransport('/sse', res);
 
-        sseTransports.set(sessionId, transport);
+        // connect() calls transport.start() which sets transport.sessionId
+        await mcpServer.connect(transport);
+
+        // Now transport.sessionId is the SDK-generated UUID the client will use
+        const sdkSessionId = transport.sessionId;
+        sseTransports.set(sdkSessionId, transport);
         sseByIndex.set(idx, transport);
         if (req.ip) sseTransports.set(`ip:${req.ip}`, transport);
 
-        await mcpServer.connect(transport);
-        console.log(`[SSE MCP] Ready — session=${sessionId} tools=${this.getToolsCount().total}`);
+        console.log(`[SSE MCP] Ready — sdkSession=${sdkSessionId} tools=${this.getToolsCount().total}`);
 
         req.on('close', () => {
-          sseTransports.delete(sessionId);
+          sseTransports.delete(sdkSessionId);
           sseByIndex.delete(idx);
           if (req.ip) sseTransports.delete(`ip:${req.ip}`);
-          console.log(`[SSE MCP] Closed — session=${sessionId}`);
+          console.log(`[SSE MCP] Closed — sdkSession=${sdkSessionId}`);
         });
       } catch (err) {
         console.error(`[SSE MCP] Setup error:`, err);
@@ -607,6 +614,7 @@ class VapiMCPServer {
     });
 
     this.app.post('/sse', async (req, res) => {
+      // The client sends the SDK-generated UUID as ?sessionId=<uuid>
       const sessionId = (req.query.sessionId as string) || 'unknown';
 
       const transport = sseTransports.get(sessionId)
@@ -616,6 +624,7 @@ class VapiMCPServer {
             : undefined);
 
       if (!transport) {
+        console.error(`[SSE MCP] No transport for sessionId=${sessionId}`);
         res.status(404).json({ error: 'SSE session not found' });
         return;
       }
@@ -631,21 +640,21 @@ class VapiMCPServer {
     // ElevenLabs alias
     this.app.get('/elevenlabs', async (req, res) => {
       const idx = sseIndex++;
-      const sessionId = (req.query.sessionId as string) || `el-${idx}`;
       console.log(`[ElevenLabs MCP] New connection #${idx}`);
 
       try {
         const mcpServer = this.createMCPServer();
         const transport = new SSEServerTransport('/elevenlabs', res);
 
-        sseTransports.set(sessionId, transport);
+        await mcpServer.connect(transport);
+
+        const sdkSessionId = transport.sessionId;
+        sseTransports.set(sdkSessionId, transport);
         sseByIndex.set(idx, transport);
         if (req.ip) sseTransports.set(`ip:${req.ip}`, transport);
 
-        await mcpServer.connect(transport);
-
         req.on('close', () => {
-          sseTransports.delete(sessionId);
+          sseTransports.delete(sdkSessionId);
           sseByIndex.delete(idx);
           if (req.ip) sseTransports.delete(`ip:${req.ip}`);
         });

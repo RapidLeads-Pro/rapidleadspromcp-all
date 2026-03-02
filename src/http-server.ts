@@ -518,19 +518,21 @@ class GHLMCPHttpServer {
         const mcpServer = this.createMCPServer();
         const transport = new SSEServerTransport('/sse', res);
 
-        // Store transport so the matching POST can find it
-        const sessionId = (req.query.sessionId as string) || `auto-${currentIndex}`;
-        activeTransports.set(sessionId, transport);
+        // connect() calls transport.start() which assigns the SDK-generated UUID
+        // to transport.sessionId and sends it to the client via the 'endpoint' event.
+        // We MUST store by transport.sessionId (after connect) so POST /sse lookups match.
+        await mcpServer.connect(transport);
+
+        const sdkSessionId = transport.sessionId;
+        activeTransports.set(sdkSessionId, transport);
         transportsByIndex.set(currentIndex, transport);
         if (req.ip) activeTransports.set(`ip:${req.ip}`, transport);
 
-        await mcpServer.connect(transport);
-
-        console.log(`[${client} MCP] SSE ready — session: ${sessionId}, tools: ${this.getToolsCount().total}`);
+        console.log(`[${client} MCP] SSE ready — sdkSession: ${sdkSessionId}, tools: ${this.getToolsCount().total}`);
 
         req.on('close', () => {
-          console.log(`[${client} MCP] SSE closed — session: ${sessionId}`);
-          activeTransports.delete(sessionId);
+          console.log(`[${client} MCP] SSE closed — sdkSession: ${sdkSessionId}`);
+          activeTransports.delete(sdkSessionId);
           transportsByIndex.delete(currentIndex);
           if (req.ip) activeTransports.delete(`ip:${req.ip}`);
         });
@@ -581,17 +583,17 @@ class GHLMCPHttpServer {
         const mcpServer = this.createMCPServer();
         const transport = new SSEServerTransport('/elevenlabs', res);
 
-        const sessionId = (req.query.sessionId as string) || `el-${currentIndex}`;
-        activeTransports.set(sessionId, transport);
+        await mcpServer.connect(transport);
+
+        const sdkSessionId = transport.sessionId;
+        activeTransports.set(sdkSessionId, transport);
         transportsByIndex.set(currentIndex, transport);
         if (req.ip) activeTransports.set(`ip:${req.ip}`, transport);
 
-        await mcpServer.connect(transport);
-
-        console.log(`[ElevenLabs MCP] SSE ready — session: ${sessionId}, tools: ${this.getToolsCount().total}`);
+        console.log(`[ElevenLabs MCP] SSE ready — sdkSession: ${sdkSessionId}, tools: ${this.getToolsCount().total}`);
 
         req.on('close', () => {
-          activeTransports.delete(sessionId);
+          activeTransports.delete(sdkSessionId);
           transportsByIndex.delete(currentIndex);
           if (req.ip) activeTransports.delete(`ip:${req.ip}`);
         });
