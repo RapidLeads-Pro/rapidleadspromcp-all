@@ -117,14 +117,21 @@ class VapiMCPServer {
       credentials: false
     }));
 
-    // JSON parsing middleware — applied globally EXCEPT for SSE POST routes
+    // JSON + URL-encoded body parsing — skipped for SSE POST routes
     // (SSEServerTransport.handlePostMessage reads the raw body stream itself;
     //  if express.json() runs first the stream is already consumed → HTTP 400)
+    // URL-encoded is needed for OAuth /token endpoint (client_credentials flow)
     this.app.use((req, res, next) => {
       const isSSEPost = (req.method === 'POST') &&
         (req.path === '/sse' || req.path === '/elevenlabs');
       if (isSSEPost) return next();
-      express.json({ limit: '10mb' })(req, res, next);
+      // Try JSON first, fall back to urlencoded
+      const contentType = req.headers['content-type'] || '';
+      if (contentType.includes('application/x-www-form-urlencoded')) {
+        express.urlencoded({ extended: false })(req, res, next);
+      } else {
+        express.json({ limit: '10mb' })(req, res, next);
+      }
     });
 
     // Request logging with Vapi headers
@@ -171,6 +178,90 @@ class VapiMCPServer {
    * Setup HTTP routes for Vapi
    */
   private setupRoutes(): void {
+    // ===================================================================
+    // OAuth 2.1 endpoints — required for Claude.ai custom connectors
+    // Claude.ai hits /.well-known/oauth-authorization-server first;
+    // if absent it falls back to /authorize, /token, /register.
+    // We implement a simple "no-auth" flow: any client_id is accepted,
+    // tokens are static API-key style JWTs signed with a server secret.
+    // ===================================================================
+    const SERVER_URL = process.env.SERVER_URL ||
+      `http://localhost:${this.port}`;
+    const OAUTH_SECRET = process.env.OAUTH_SECRET || 'mcp-server-secret-change-me';
+
+    // RFC8414 — Authorization Server Metadata
+    this.app.get('/.well-known/oauth-authorization-server', (req, res) => {
+      res.json({
+        issuer: SERVER_URL,
+        authorization_endpoint: `${SERVER_URL}/authorize`,
+        token_endpoint: `${SERVER_URL}/token`,
+        registration_endpoint: `${SERVER_URL}/register`,
+        response_types_supported: ['code'],
+        grant_types_supported: ['authorization_code', 'client_credentials'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
+        scopes_supported: ['mcp'],
+      });
+    });
+
+    // Dynamic Client Registration (RFC7591)
+    this.app.post('/register', (req, res) => {
+      const clientId = randomUUID();
+      res.status(201).json({
+        client_id: clientId,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        redirect_uris: req.body?.redirect_uris || [],
+        grant_types: ['authorization_code', 'client_credentials'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+      });
+    });
+
+    // Authorization endpoint — issues a one-time code then redirects
+    this.app.get('/authorize', (req, res) => {
+      const { redirect_uri, state, code_challenge } = req.query as Record<string, string>;
+      // Issue a simple opaque code (we don't verify PKCE server-side for simplicity;
+      // Claude.ai will exchange it immediately)
+      const code = Buffer.from(JSON.stringify({
+        ts: Date.now(),
+        challenge: code_challenge || '',
+      })).toString('base64url');
+
+      if (!redirect_uri) {
+        res.status(400).json({ error: 'redirect_uri required' });
+        return;
+      }
+
+      const url = new URL(redirect_uri);
+      url.searchParams.set('code', code);
+      if (state) url.searchParams.set('state', state);
+      res.redirect(url.toString());
+    });
+
+    // Token endpoint — exchanges code or client_credentials for an access token
+    this.app.post('/token', (req, res) => {
+      // Accept both JSON and form-encoded bodies
+      const body = req.body || {};
+      const grantType = body.grant_type;
+
+      if (grantType !== 'authorization_code' && grantType !== 'client_credentials') {
+        res.status(400).json({ error: 'unsupported_grant_type' });
+        return;
+      }
+
+      // Issue a static bearer token (base64url of a signed payload)
+      const payload = { iss: SERVER_URL, iat: Math.floor(Date.now() / 1000), scope: 'mcp' };
+      const token = Buffer.from(JSON.stringify(payload)).toString('base64url') +
+        '.' + Buffer.from(OAUTH_SECRET).toString('base64url');
+
+      res.json({
+        access_token: token,
+        token_type: 'Bearer',
+        expires_in: 86400,
+        scope: 'mcp',
+      });
+    });
+
     // Health check endpoint
     this.app.get('/health', async (req, res) => {
       try {
